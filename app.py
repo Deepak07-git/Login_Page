@@ -1,5 +1,7 @@
 import os
+import json
 import sqlite3
+import urllib.request
 from flask import Flask, render_template_string, request, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -7,56 +9,114 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
 
-# Database setup (SQLite): uses /tmp on Vercel or local users.db
+# Cloud KV (Upstash / Vercel KV) config
+KV_URL = os.environ.get("KV_REST_API_URL") or os.environ.get("UPSTASH_REDIS_REST_URL")
+KV_TOKEN = os.environ.get("KV_REST_API_TOKEN") or os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+
+# SQLite config (local disk or /tmp)
 DB_PATH = os.environ.get("DB_PATH", "/tmp/users.db" if os.environ.get("VERCEL") else "users.db")
 
 
-def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password_hash TEXT NOT NULL
+def init_sqlite():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print("SQLite init error:", e)
+
+
+def sqlite_get(username):
+    init_sqlite()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception as e:
+        print("SQLite get error:", e)
+        return None
+
+
+def sqlite_set(username, pw_hash):
+    init_sqlite()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, pw_hash))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    except Exception as e:
+        print("SQLite set error:", e)
+        return False
+
+
+def kv_get(username):
+    try:
+        url = f"{KV_URL.rstrip('/')}/get/user:{username}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {KV_TOKEN}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("result")
+    except Exception as e:
+        print("KV get error:", e)
+        return None
+
+
+def kv_set(username, pw_hash):
+    try:
+        if kv_get(username):
+            return False
+        url = f"{KV_URL.rstrip('/')}/set/user:{username}"
+        req = urllib.request.Request(
+            url,
+            data=pw_hash.encode("utf-8"),
+            headers={"Authorization": f"Bearer {KV_TOKEN}"},
+            method="POST",
         )
-    """)
-    # Seed default demo user 'deepak' if not already present
-    c.execute("SELECT username FROM users WHERE username = ?", ("deepak",))
-    if not c.fetchone():
-        c.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            ("deepak", generate_password_hash("python123")),
-        )
-    conn.commit()
-    conn.close()
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status in (200, 201)
+    except Exception as e:
+        print("KV set error:", e)
+        return False
 
 
 def get_user_hash(username):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT password_hash FROM users WHERE username = ?", (username.lower(),))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+    u = username.lower().strip()
+    if u == "deepak":
+        return generate_password_hash("python123")
+
+    if KV_URL and KV_TOKEN:
+        val = kv_get(u)
+        if val:
+            return val
+
+    return sqlite_get(u)
 
 
 def create_user(username, password):
-    init_db()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    try:
-        c.execute(
-            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-            (username.lower(), generate_password_hash(password)),
-        )
-        conn.commit()
-        ok = True
-    except sqlite3.IntegrityError:
-        ok = False
-    finally:
-        conn.close()
-    return ok
+    u = username.lower().strip()
+    if u == "deepak":
+        return False
+
+    pw_hash = generate_password_hash(password)
+
+    if KV_URL and KV_TOKEN:
+        return kv_set(u, pw_hash)
+
+    return sqlite_set(u, pw_hash)
 
 
 STYLE = """
@@ -294,9 +354,6 @@ DASHBOARD_PAGE = """
       <div class="badge">{{ user[0]|upper }}</div>
       <h2>Hi, {{ user|capitalize }}</h2>
       <p class="sub">You're signed in.</p>
-      {% if just_registered %}
-      <div class="success" style="margin: 16px auto; max-width: 320px;">Your account has been created successfully!</div>
-      {% endif %}
       <a class="btn" href="/logout" style="padding:14px 28px; width:auto">Sign out</a>
     </div>
   </main>
@@ -362,19 +419,19 @@ def handle_all(path):
             stored_hash = get_user_hash(username)
             if stored_hash and check_password_hash(stored_hash, password):
                 session["user"] = username
-                return render_template_string(DASHBOARD_PAGE, user=username, just_registered=False)
+                return render_template_string(DASHBOARD_PAGE, user=username)
             error = "Wrong username or password. Check both and try again."
             return render_template_string(AUTH_PAGE, error=error, username=username, mode="login")
 
     # If already logged in, show Dashboard directly
     if "user" in session:
-        return render_template_string(DASHBOARD_PAGE, user=session["user"], just_registered=False)
+        return render_template_string(DASHBOARD_PAGE, user=session["user"])
 
     # Initial page load: show Sign In tab
     return render_template_string(AUTH_PAGE, error=None, username="", mode="login")
 
 
 if __name__ == "__main__":
-    init_db()
+    init_sqlite()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
