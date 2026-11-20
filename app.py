@@ -1,4 +1,5 @@
 import os
+import sqlite3
 from flask import Flask, render_template_string, request, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -6,10 +7,57 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
 
-# Demo user store. Passwords are stored hashed, never as plain text.
-USERS = {
-    "deepak": generate_password_hash("python123"),
-}
+# Database setup (SQLite): uses /tmp on Vercel or local users.db
+DB_PATH = os.environ.get("DB_PATH", "/tmp/users.db" if os.environ.get("VERCEL") else "users.db")
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL
+        )
+    """)
+    # Seed default demo user 'deepak' if not already present
+    c.execute("SELECT username FROM users WHERE username = ?", ("deepak",))
+    if not c.fetchone():
+        c.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            ("deepak", generate_password_hash("python123")),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_user_hash(username):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT password_hash FROM users WHERE username = ?", (username.lower(),))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def create_user(username, password):
+    init_db()
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    try:
+        c.execute(
+            "INSERT INTO users (username, password_hash) VALUES (?, ?)",
+            (username.lower(), generate_password_hash(password)),
+        )
+        conn.commit()
+        ok = True
+    except sqlite3.IntegrityError:
+        ok = False
+    finally:
+        conn.close()
+    return ok
+
 
 STYLE = """
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -23,6 +71,7 @@ STYLE = """
     --muted: #5d6b68;
     --line: #d9dfdb;
     --error: #b3261e;
+    --success: #0e6245;
   }
   * { box-sizing: border-box; margin: 0; }
   body {
@@ -65,7 +114,33 @@ STYLE = """
   .panel { display: grid; place-items: center; padding: 32px; }
   .card { width: 100%; max-width: 380px; }
   .card h2 { font-size: 30px; font-weight: 800; }
-  .card .sub { color: var(--muted); margin: 8px 0 28px; }
+  .card .sub { color: var(--muted); margin: 8px 0 20px; }
+
+  .tabs {
+    display: flex;
+    background: #e4ece7;
+    border-radius: 10px;
+    padding: 4px;
+    margin-bottom: 22px;
+  }
+  .tab-btn {
+    flex: 1;
+    padding: 10px 14px;
+    border: 0;
+    background: transparent;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 700;
+    color: var(--muted);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all .2s;
+  }
+  .tab-btn.active {
+    background: #fff;
+    color: var(--ink);
+    box-shadow: 0 2px 6px rgba(0,0,0,0.06);
+  }
 
   label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 6px; }
   .field { margin-bottom: 18px; position: relative; }
@@ -83,6 +158,10 @@ STYLE = """
     background: #fdecea; color: var(--error); border-radius: 10px;
     padding: 12px 14px; font-size: 14px; margin-bottom: 18px;
   }
+  .success {
+    background: #e8f5e9; color: var(--success); border-radius: 10px;
+    padding: 12px 14px; font-size: 14px; margin-bottom: 18px;
+  }
   .btn {
     width: 100%; padding: 14px; font: inherit; font-weight: 700; color: #fff;
     background: var(--ink); border: 0; border-radius: 10px; cursor: pointer;
@@ -90,7 +169,7 @@ STYLE = """
   }
   .btn:hover { background: #0b2e2f; }
   .btn:active { transform: scale(.98); }
-  .btn:focus-visible, .toggle:focus-visible { outline: 3px solid var(--mint); outline-offset: 2px; }
+  .btn:focus-visible, .toggle:focus-visible, .tab-btn:focus-visible { outline: 3px solid var(--mint); outline-offset: 2px; }
   .hint { margin-top: 20px; font-size: 13px; color: var(--muted); text-align: center; }
   .hint b { color: var(--text); }
 
@@ -110,13 +189,13 @@ STYLE = """
 </style>
 """
 
-LOGIN_PAGE = """
+AUTH_PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in</title>
+  <title>Sign in / Register - PyPortal</title>
   """ + STYLE + """
 </head>
 <body>
@@ -131,36 +210,70 @@ LOGIN_PAGE = """
     </aside>
 
     <main class="panel">
-      <form class="card" method="post" action="">
-        <h2>Sign in</h2>
-        <p class="sub">Enter your details to continue.</p>
-
-        {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
-
-        <div class="field">
-          <label for="username">Username</label>
-          <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username" required autofocus>
+      <div class="card">
+        <div class="tabs">
+          <button type="button" class="tab-btn active" id="tab-login" onclick="switchMode('login')">Sign in</button>
+          <button type="button" class="tab-btn" id="tab-register" onclick="switchMode('register')">Register</button>
         </div>
 
-        <div class="field">
-          <label for="password">Password</label>
-          <input type="password" id="password" name="password" autocomplete="current-password" required>
-          <button type="button" class="toggle" onclick="togglePassword(this)">Show</button>
-        </div>
+        <form method="post" action="">
+          <input type="hidden" name="mode" id="auth-mode" value="{{ mode or 'login' }}">
+          <h2 id="form-title">Sign in</h2>
+          <p class="sub" id="form-sub">Enter your details to continue.</p>
 
-        <button class="btn" type="submit">Sign in</button>
-        <p class="hint">Demo account: <b>deepak</b> / <b>python123</b></p>
-      </form>
+          {% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+          {% if success %}<div class="success" role="status">{{ success }}</div>{% endif %}
+
+          <div class="field">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" value="{{ username }}" autocomplete="username" required autofocus>
+          </div>
+
+          <div class="field">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+            <button type="button" class="toggle" onclick="togglePassword(this, 'password')">Show</button>
+          </div>
+
+          <div class="field" id="confirm-field" style="display: none;">
+            <label for="confirm_password">Confirm Password</label>
+            <input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password">
+            <button type="button" class="toggle" onclick="togglePassword(this, 'confirm_password')">Show</button>
+          </div>
+
+          <button class="btn" type="submit" id="submit-btn">Sign in</button>
+
+          <p class="hint" id="hint-login">Demo account: <b>deepak</b> / <b>python123</b></p>
+          <p class="hint" id="hint-register" style="display: none;">Password must be at least 6 characters.</p>
+        </form>
+      </div>
     </main>
   </div>
 
   <script>
-    function togglePassword(btn) {
-      const input = document.getElementById("password");
-      const show = input.type === "password";
-      input.type = show ? "text" : "password";
-      btn.textContent = show ? "Hide" : "Show";
+    function switchMode(mode) {
+      const isRegister = mode === 'register';
+      document.getElementById('auth-mode').value = mode;
+      document.getElementById('tab-login').classList.toggle('active', !isRegister);
+      document.getElementById('tab-register').classList.toggle('active', isRegister);
+      document.getElementById('form-title').textContent = isRegister ? 'Create an account' : 'Sign in';
+      document.getElementById('form-sub').textContent = isRegister ? 'Enter details to create your account.' : 'Enter your details to continue.';
+      document.getElementById('confirm-field').style.display = isRegister ? 'block' : 'none';
+      document.getElementById('confirm_password').required = isRegister;
+      document.getElementById('submit-btn').textContent = isRegister ? 'Create account' : 'Sign in';
+      document.getElementById('hint-login').style.display = isRegister ? 'none' : 'block';
+      document.getElementById('hint-register').style.display = isRegister ? 'block' : 'none';
     }
+
+    function togglePassword(btn, inputId) {
+      const input = document.getElementById(inputId);
+      const show = input.type === 'password';
+      input.type = show ? 'text' : 'password';
+      btn.textContent = show ? 'Hide' : 'Show';
+    }
+
+    // Set initial mode
+    switchMode("{{ mode or 'login' }}");
   </script>
 </body>
 </html>
@@ -172,7 +285,7 @@ DASHBOARD_PAGE = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Dashboard</title>
+  <title>Dashboard - PyPortal</title>
   """ + STYLE + """
 </head>
 <body>
@@ -181,6 +294,9 @@ DASHBOARD_PAGE = """
       <div class="badge">{{ user[0]|upper }}</div>
       <h2>Hi, {{ user|capitalize }}</h2>
       <p class="sub">You're signed in.</p>
+      {% if just_registered %}
+      <div class="success" style="margin: 16px auto; max-width: 320px;">Your account has been created successfully!</div>
+      {% endif %}
       <a class="btn" href="/logout" style="padding:14px 28px; width:auto">Sign out</a>
     </div>
   </main>
@@ -194,7 +310,6 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def handle_all(path):
-    # Determine the requested path
     req_path = (
         request.args.get("path")
         or request.headers.get("x-matched-path")
@@ -206,26 +321,55 @@ def handle_all(path):
     # Logout
     if clean == "logout":
         session.clear()
-        return render_template_string(LOGIN_PAGE, error=None, username="")
+        return render_template_string(AUTH_PAGE, error=None, success="You have been signed out.", username="", mode="login")
 
-    # Login Submission (POST)
+    # Form Submission (Login or Register)
     if request.method == "POST":
+        mode = request.form.get("mode", "login")
         username = request.form.get("username", "").strip().lower()
         password = request.form.get("password", "")
-        if username in USERS and check_password_hash(USERS[username], password):
+
+        if mode == "register":
+            confirm_password = request.form.get("confirm_password", "")
+            if len(username) < 3:
+                error = "Username must be at least 3 characters long."
+                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+            if not username.replace("_", "").isalnum():
+                error = "Username can only contain letters, numbers, and underscores."
+                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+            if len(password) < 6:
+                error = "Password must be at least 6 characters long."
+                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+            if password != confirm_password:
+                error = "Passwords do not match. Please re-enter."
+                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+
+            if not create_user(username, password):
+                error = f"Username '{username}' is already taken. Please choose another."
+                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+
+            # Registration successful: log them directly into their new account
             session["user"] = username
-            return render_template_string(DASHBOARD_PAGE, user=username)
-        error = "Wrong username or password. Check both and try again."
-        return render_template_string(LOGIN_PAGE, error=error, username=username)
+            return render_template_string(DASHBOARD_PAGE, user=username, just_registered=True)
 
-    # If already logged in, show Dashboard directly without redirects
+        else:
+            # Sign In mode
+            stored_hash = get_user_hash(username)
+            if stored_hash and check_password_hash(stored_hash, password):
+                session["user"] = username
+                return render_template_string(DASHBOARD_PAGE, user=username, just_registered=False)
+            error = "Wrong username or password. Check both and try again."
+            return render_template_string(AUTH_PAGE, error=error, username=username, mode="login")
+
+    # If already logged in, show Dashboard directly
     if "user" in session:
-        return render_template_string(DASHBOARD_PAGE, user=session["user"])
+        return render_template_string(DASHBOARD_PAGE, user=session["user"], just_registered=False)
 
-    # If not logged in, show Sign in page directly
-    return render_template_string(LOGIN_PAGE, error=None, username="")
+    # Initial page load: show Sign In tab
+    return render_template_string(AUTH_PAGE, error=None, username="", mode="login")
 
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
