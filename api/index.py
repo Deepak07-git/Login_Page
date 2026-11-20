@@ -348,9 +348,14 @@ def handle_all(path):
                 error = f"Username '{username}' is already taken. Please choose another."
                 return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
 
-            # Registration successful: log them directly into their new account
-            session["user"] = username
-            return render_template_string(DASHBOARD_PAGE, user=username, just_registered=True)
+            # Registration successful: send user to Sign In tab with a success banner
+            return render_template_string(
+                AUTH_PAGE,
+                error=None,
+                success=f"Account created successfully for '{username}'! Please sign in with your password.",
+                username=username,
+                mode="login",
+            )
 
         else:
             # Sign In mode
