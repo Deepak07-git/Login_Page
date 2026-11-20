@@ -1,8 +1,9 @@
+import os
 from flask import Flask, render_template_string, request, redirect, url_for, session
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-app.secret_key = "change-this-secret-key"  # change this before deploying
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
 
 # Demo user store. Passwords are stored hashed, never as plain text.
 USERS = {
@@ -219,4 +220,5 @@ def logout():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
