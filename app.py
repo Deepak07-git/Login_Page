@@ -130,7 +130,7 @@ LOGIN_PAGE = """
     </aside>
 
     <main class="panel">
-      <form class="card" method="post" action="{{ url_for('login') }}">
+      <form class="card" method="post" action="">
         <h2>Sign in</h2>
         <p class="sub">Enter your details to continue.</p>
 
@@ -188,44 +188,21 @@ DASHBOARD_PAGE = """
 """
 
 
-class VercelMiddleware:
-    """WSGI middleware to adapt Vercel serverless request paths to Flask routes."""
-    def __init__(self, wsgi_app):
-        self.wsgi_app = wsgi_app
+from werkzeug.middleware.proxy_fix import ProxyFix
 
-    def __call__(self, environ, start_response):
-        matched_path = (
-            environ.get("HTTP_X_MATCHED_PATH")
-            or environ.get("HTTP_X_FORWARDED_URI")
-            or environ.get("REQUEST_URI")
-        )
-        if matched_path:
-            environ["PATH_INFO"] = matched_path.split("?")[0]
-        else:
-            path = environ.get("PATH_INFO", "")
-            if path.startswith("/api/index"):
-                environ["PATH_INFO"] = path[len("/api/index"):] or "/"
-            elif path.startswith("/api"):
-                environ["PATH_INFO"] = path[len("/api"):] or "/"
-        return self.wsgi_app(environ, start_response)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 
-app.wsgi_app = VercelMiddleware(app.wsgi_app)
-
-
-@app.route("/api/index")
-@app.route("/")
-def home():
-    return redirect(url_for("dashboard" if "user" in session else "login"))
-
-
-@app.route("/api/index/login", methods=["GET", "POST"])
+@app.route("/", methods=["GET", "POST"])
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    if "user" in session and request.method == "GET":
+        return redirect(url_for("dashboard"))
+
     error, username = None, ""
     if request.method == "POST":
-        username = request.form["username"].strip().lower()
-        password = request.form["password"]
+        username = request.form.get("username", "").strip().lower()
+        password = request.form.get("password", "")
         if username in USERS and check_password_hash(USERS[username], password):
             session["user"] = username
             return redirect(url_for("dashboard"))
@@ -233,7 +210,6 @@ def login():
     return render_template_string(LOGIN_PAGE, error=error, username=username)
 
 
-@app.route("/api/index/dashboard")
 @app.route("/dashboard")
 def dashboard():
     if "user" not in session:
@@ -241,7 +217,6 @@ def dashboard():
     return render_template_string(DASHBOARD_PAGE, user=session["user"])
 
 
-@app.route("/api/index/logout")
 @app.route("/logout")
 def logout():
     session.clear()
