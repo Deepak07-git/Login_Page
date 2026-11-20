@@ -18,8 +18,8 @@ DB_PATH = os.environ.get("DB_PATH", "/tmp/users.db" if os.environ.get("VERCEL") 
 
 
 def init_sqlite():
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     try:
-        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -28,69 +28,64 @@ def init_sqlite():
             )
         """)
         conn.commit()
-        conn.close()
     except Exception as e:
         print("SQLite init error:", e)
+    finally:
+        conn.close()
 
 
 def sqlite_get(username):
     init_sqlite()
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     try:
-        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
         row = c.fetchone()
-        conn.close()
         return row[0] if row else None
     except Exception as e:
         print("SQLite get error:", e)
         return None
+    finally:
+        conn.close()
 
 
 def sqlite_set(username, pw_hash):
     init_sqlite()
+    conn = sqlite3.connect(DB_PATH, timeout=15.0)
     try:
-        conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
         c.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (username, pw_hash))
         conn.commit()
-        conn.close()
-        return True
+        return True, None
     except sqlite3.IntegrityError:
-        return False
+        return False, f"Username '{username}' is already taken. Please choose another."
     except Exception as e:
         print("SQLite set error:", e)
-        return False
+        return False, f"Database error: {str(e)}"
+    finally:
+        conn.close()
 
 
-def kv_get(username):
+def kv_command(*cmd_args):
+    """Execute command against Upstash Redis REST API using JSON command array."""
     try:
-        url = f"{KV_URL.rstrip('/')}/get/user:{username}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {KV_TOKEN}"})
+        url = KV_URL.rstrip("/")
+        payload = json.dumps(list(cmd_args)).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {KV_TOKEN}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             return data.get("result")
     except Exception as e:
-        print("KV get error:", e)
+        print("KV command error:", e)
         return None
-
-
-def kv_set(username, pw_hash):
-    try:
-        if kv_get(username):
-            return False
-        url = f"{KV_URL.rstrip('/')}/set/user:{username}"
-        req = urllib.request.Request(
-            url,
-            data=pw_hash.encode("utf-8"),
-            headers={"Authorization": f"Bearer {KV_TOKEN}"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return resp.status in (200, 201)
-    except Exception as e:
-        print("KV set error:", e)
-        return False
 
 
 def get_user_hash(username):
@@ -99,8 +94,8 @@ def get_user_hash(username):
         return generate_password_hash("python123")
 
     if KV_URL and KV_TOKEN:
-        val = kv_get(u)
-        if val:
+        val = kv_command("GET", f"user:{u}")
+        if val is not None:
             return val
 
     return sqlite_get(u)
@@ -109,12 +104,19 @@ def get_user_hash(username):
 def create_user(username, password):
     u = username.lower().strip()
     if u == "deepak":
-        return False
+        return False, "Username 'deepak' is reserved for the demo account."
+
+    # Check if already taken
+    if get_user_hash(u) is not None:
+        return False, f"Username '{u}' is already taken. Please choose another."
 
     pw_hash = generate_password_hash(password)
 
     if KV_URL and KV_TOKEN:
-        return kv_set(u, pw_hash)
+        res = kv_command("SET", f"user:{u}", pw_hash)
+        if res == "OK":
+            return True, None
+        return False, "Could not save account to cloud storage. Please try again."
 
     return sqlite_set(u, pw_hash)
 
@@ -272,11 +274,11 @@ AUTH_PAGE = """
     <main class="panel">
       <div class="card">
         <div class="tabs">
-          <button type="button" class="tab-btn active" id="tab-login" onclick="switchMode('login')">Sign in</button>
-          <button type="button" class="tab-btn" id="tab-register" onclick="switchMode('register')">Register</button>
+          <button type="button" class="tab-btn active" id="tab-login" onclick="switchMode('login', true)">Sign in</button>
+          <button type="button" class="tab-btn" id="tab-register" onclick="switchMode('register', true)">Register</button>
         </div>
 
-        <form method="post" action="">
+        <form method="post" action="" onsubmit="return validateAuthForm(event)">
           <input type="hidden" name="mode" id="auth-mode" value="{{ mode or 'login' }}">
           <h2 id="form-title">Sign in</h2>
           <p class="sub" id="form-sub">Enter your details to continue.</p>
@@ -311,7 +313,7 @@ AUTH_PAGE = """
   </div>
 
   <script>
-    function switchMode(mode) {
+    function switchMode(mode, fromUserClick = false) {
       const isRegister = mode === 'register';
       document.getElementById('auth-mode').value = mode;
       document.getElementById('tab-login').classList.toggle('active', !isRegister);
@@ -323,6 +325,14 @@ AUTH_PAGE = """
       document.getElementById('submit-btn').textContent = isRegister ? 'Create account' : 'Sign in';
       document.getElementById('hint-login').style.display = isRegister ? 'none' : 'block';
       document.getElementById('hint-register').style.display = isRegister ? 'block' : 'none';
+
+      // Only clear messages when user explicitly clicks between tabs
+      if (fromUserClick) {
+        const err = document.querySelector('.error');
+        if (err) err.remove();
+        const succ = document.querySelector('.success');
+        if (succ) succ.remove();
+      }
     }
 
     function togglePassword(btn, inputId) {
@@ -332,8 +342,28 @@ AUTH_PAGE = """
       btn.textContent = show ? 'Hide' : 'Show';
     }
 
-    // Set initial mode
-    switchMode("{{ mode or 'login' }}");
+    function validateAuthForm(e) {
+      const mode = document.getElementById('auth-mode').value;
+      if (mode === 'register') {
+        const pw = document.getElementById('password').value;
+        const cpw = document.getElementById('confirm_password').value;
+        if (pw.length < 6) {
+          alert('Password must be at least 6 characters long.');
+          e.preventDefault();
+          return false;
+        }
+        if (pw !== cpw) {
+          alert('Passwords do not match! Please make sure both password fields match.');
+          document.getElementById('confirm_password').focus();
+          e.preventDefault();
+          return false;
+        }
+      }
+      return true;
+    }
+
+    // Set initial mode on page render (do NOT clear errors on load)
+    switchMode("{{ mode or 'login' }}", false);
   </script>
 </body>
 </html>
@@ -401,9 +431,9 @@ def handle_all(path):
                 error = "Passwords do not match. Please re-enter."
                 return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
 
-            if not create_user(username, password):
-                error = f"Username '{username}' is already taken. Please choose another."
-                return render_template_string(AUTH_PAGE, error=error, username=username, mode="register")
+            ok, err_msg = create_user(username, password)
+            if not ok:
+                return render_template_string(AUTH_PAGE, error=err_msg, username=username, mode="register")
 
             # Registration successful: send user to Sign In tab with a success banner
             return render_template_string(
