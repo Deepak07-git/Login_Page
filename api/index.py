@@ -1,5 +1,5 @@
 import os
-from flask import Flask, render_template_string, request, redirect, session
+from flask import Flask, render_template_string, request, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -194,29 +194,33 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST"])
 @app.route("/<path:path>", methods=["GET", "POST"])
 def handle_all(path):
-    # Normalize path regardless of whether Vercel passed /api/index, /login, or /
-    clean = path.replace("api/index", "").strip("/")
+    # Determine the requested path
+    req_path = (
+        request.args.get("path")
+        or request.headers.get("x-matched-path")
+        or request.headers.get("x-forwarded-uri")
+        or path
+    )
+    clean = req_path.replace("api/index", "").strip("/")
 
-    if clean == "dashboard":
-        if "user" not in session:
-            return redirect("/login")
+    # Logout
+    if clean == "logout":
+        session.clear()
+        return render_template_string(LOGIN_PAGE, error=None, username="")
+
+    # Login Submission (POST)
+    if request.method == "POST":
+        username = request.form.get("username", "").strip().lower()
+        password = request.form.get("password", "")
+        if username in USERS and check_password_hash(USERS[username], password):
+            session["user"] = username
+            return render_template_string(DASHBOARD_PAGE, user=username)
+        error = "Wrong username or password. Check both and try again."
+        return render_template_string(LOGIN_PAGE, error=error, username=username)
+
+    # If already logged in, show Dashboard directly without redirects
+    if "user" in session:
         return render_template_string(DASHBOARD_PAGE, user=session["user"])
 
-    elif clean == "logout":
-        session.clear()
-        return redirect("/login")
-
-    else:
-        # Default route (home / login)
-        if "user" in session and request.method == "GET":
-            return redirect("/dashboard")
-
-        error, username = None, ""
-        if request.method == "POST":
-            username = request.form.get("username", "").strip().lower()
-            password = request.form.get("password", "")
-            if username in USERS and check_password_hash(USERS[username], password):
-                session["user"] = username
-                return redirect("/dashboard")
-            error = "Wrong username or password. Check both and try again."
-        return render_template_string(LOGIN_PAGE, error=error, username=username)
+    # If not logged in, show Sign in page directly
+    return render_template_string(LOGIN_PAGE, error=None, username="")
